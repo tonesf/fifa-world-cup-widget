@@ -23,7 +23,7 @@ A live-updating **Scriptable widget** for the 2026 FIFA World Cup. See today's s
 
 | Home Screen Widget | Day Browser |
 |---|---|
-| *(screenshot)* | *(screenshot)* |
+|<img width="966" height="675" alt="image" src="https://github.com/user-attachments/assets/e559847a-c75b-4afb-8c25-a83ca7aa32e2" />|
 
 ---
 
