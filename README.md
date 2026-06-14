@@ -1,6 +1,6 @@
 # ⚽ World Cup 2026 — iOS Widget + Day Browser
 
-A beautiful, live-updating **Scriptable widget** for the 2026 FIFA World Cup. See today's scores and kickoff times right on your iPhone Home Screen, and tap to open a full interactive day browser with swipe navigation.
+A live-updating **Scriptable widget** for the 2026 FIFA World Cup. See today's scores and kickoff times right on your iPhone Home Screen, and tap to open a full interactive day browser with swipe navigation.
 
 **Works anywhere in the world** — all 104 games automatically display in your local timezone.
 
