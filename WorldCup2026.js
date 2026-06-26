@@ -232,38 +232,81 @@ const wf = name => WF[name] || ''
 const shortTeam = n => ({'South Africa':'S. Africa','South Korea':'S. Korea','Bosnia & Herz.':'Bosnia','New Zealand':'N. Zealand','Cape Verde':'C. Verde','Saudi Arabia':'S. Arabia'}[n]||n)
 const shortBadge = g => ({R32:'R32',R16:'R16',QF:'QF',SF:'SF','3RD':'3P','FIN':'🏆'}[g]||g)
 
-// ── FETCH SCORES FROM ESPN ────────────────────────────────────
-async function fetchScores() {
-  const scoreMap={}
+// Reverse map: normalized name → our canonical display spelling.
+// Lets us turn an ESPN name ("Turkey", "Bosnia and Herzegovina") back into
+// the exact spelling our flag/shorten lookups expect ("Türkiye", "Bosnia & Herz.").
+const CANON = {}
+Object.keys(WF).forEach(k => { CANON[normTeam(k)] = k })
+
+// A team slot is a placeholder if it's not a real country (real ones are all in WF).
+// e.g. "1st C", "2nd F", "Best 3rd", "TBD" → true
+const isPlaceholderTeam = name => !WF[name]
+
+// Fill in knockout team names from ESPN's bracket once it's known.
+// Matches each placeholder slot to an ESPN fixture by kickoff time (±2h),
+// disambiguating by venue if two games share a time. Mutates `games` in place.
+function resolveBracket(games, fixtures) {
+  if(!fixtures||!fixtures.length) return
+  for(const g of games){
+    if(!isPlaceholderTeam(g.t1) && !isPlaceholderTeam(g.t2)) continue
+    const ko=kickoffDate(g).getTime()
+    const cands=fixtures.filter(f=>Math.abs(f.t-ko)<7200000)
+    let match=null
+    if(cands.length===1){ match=cands[0] }
+    else if(cands.length>1){
+      const vtok=((g.v.split(',')[0]||'').toLowerCase().trim().split(' ')[0])
+      match=cands.find(f=>f.venue&&vtok&&f.venue.toLowerCase().indexOf(vtok)>=0)||null
+    }
+    if(match){ g.t1=match.t1; g.t2=match.t2 }
+  }
+}
+
+// ── FETCH SCORES + BRACKET FROM ESPN ──────────────────────────
+// Returns { scoreMap, fixtures }.
+//   scoreMap: keyed by sorted team pair → live/final scores
+//   fixtures: every event with two *known* teams → { t, t1, t2, venue }
+//             used to fill in knockout slots once the bracket is set
+async function fetchESPN() {
+  const scoreMap={}, fixtures=[]
   function processEvents(events) {
     for(const ev of(events||[])){
       const comp=(ev.competitions||[])[0]; if(!comp)continue
+      const comps=comp.competitors||[]; if(comps.length<2)continue
+      const nm1=comps[0].team.displayName||comps[0].team.name||''
+      const nm2=comps[1].team.displayName||comps[1].team.name||''
+
+      // Bracket fixture — only when both teams are real (not "TBD")
+      const t=Date.parse(ev.date||comp.date||'')
+      const venue=(comp.venue&&comp.venue.fullName)||''
+      const c1=CANON[normTeam(nm1)], c2=CANON[normTeam(nm2)]
+      if(t&&c1&&c2){ fixtures.push({t,t1:c1,t2:c2,venue}) }
+
+      // Score — only when live or finished
       const type=(ev.status||{}).type||{}
       const done=type.completed===true
       const live=type.name==='STATUS_IN_PROGRESS'||type.state==='in'
-      if(!done&&!live)continue
-      const scores={},normNames=[]
-      for(const c of(comp.competitors||[])){
-        const n=normTeam(c.team.displayName||c.team.name||'')
-        scores[n]=c.score||'0'; normNames.push(n)
+      if(done||live){
+        const scores={},normNames=[]
+        for(const c of comps){
+          const n=normTeam(c.team.displayName||c.team.name||'')
+          scores[n]=c.score||'0'; normNames.push(n)
+        }
+        normNames.sort()
+        scoreMap[normNames.join('|')]={scores,done,live}
       }
-      normNames.sort()
-      scoreMap[normNames.join('|')]={scores,done,live}
     }
   }
   try {
-    const s=new Date().toLocaleDateString("en-US",{timeZone:"America/Los_Angeles",month:"numeric",day:"numeric",year:"numeric"})
-    const pts=s.split("/")
-    const todayStr=pts[2]+pts[0].padStart(2,'0')+pts[1].padStart(2,'0')
-    const req=new Request("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=20260611-"+todayStr+"&limit=200")
-    req.timeoutInterval=6; const data=await req.loadJSON()
+    // Full tournament range — gets past scores AND upcoming bracket fixtures
+    const req=new Request("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=20260611-20260719&limit=300")
+    req.timeoutInterval=8; const data=await req.loadJSON()
     if(data.events&&data.events.length>0){ processEvents(data.events) }
     else {
       const r2=new Request("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard")
       r2.timeoutInterval=5; processEvents((await r2.loadJSON()).events)
     }
   } catch(e){ console.error("ESPN: "+e.message) }
-  return scoreMap
+  return {scoreMap,fixtures}
 }
 
 // Score lookup for widget context
@@ -279,7 +322,9 @@ async function buildWidget() {
   const size=config.widgetFamily||"medium"
   const maxRows={small:2,medium:4,large:8}[size]||4
   const isSmall=size==="small"
-  const scoreMap=await fetchScores()
+  const espn=await fetchESPN()
+  const scoreMap=espn.scoreMap
+  resolveBracket(GAMES, espn.fixtures)   // fill in knockout names if known
   const todayKey=getTodayKey()
   const now=Date.now()
 
@@ -651,9 +696,10 @@ render();
 if(config.runsInWidget){
   const w=await buildWidget(); Script.setWidget(w)
 } else {
-  const scores=await fetchScores()
+  const espn=await fetchESPN()
+  resolveBracket(GAMES, espn.fixtures)   // fill in knockout names if known
   const wv=new WebView()
-  await wv.loadHTML(buildBrowserHTML(JSON.stringify(scores)))
+  await wv.loadHTML(buildBrowserHTML(JSON.stringify(espn.scoreMap)))
   await wv.present(false)
 }
 Script.complete()
