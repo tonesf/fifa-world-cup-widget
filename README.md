@@ -9,6 +9,8 @@ A live-updating **Scriptable widget** for the 2026 FIFA World Cup. See today's s
 **Works anywhere in the world** — all 104 games automatically display in your local timezone.
 
 ---
+## Edits
+July 1, 2026 - added live timing + fixed bug for round of 32
 
 ## ✨ Features
 
