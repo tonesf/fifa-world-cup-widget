@@ -206,7 +206,7 @@ function normTeam(name) {
     'bosnia-herzegovina':'bosnia','bosnia and herzegovina':'bosnia','bosnia & herz.':'bosnia',
     'turkey':'turkiye','türkiye':'turkiye',
     "cote d'ivoire":'ivory coast',"côte d'ivoire":'ivory coast','ivory coast':'ivory coast',
-    'united states':'usa','dr congo':'dr congo',
+    'united states':'usa','dr congo':'dr congo','congo dr':'dr congo',
     'dem. rep. congo':'dr congo','democratic republic of congo':'dr congo',
     'curacao':'curacao','curaçao':'curacao',
   }
@@ -244,7 +244,9 @@ const isPlaceholderTeam = name => !WF[name]
 
 // Fill in knockout team names from ESPN's bracket once it's known.
 // Matches each placeholder slot to an ESPN fixture by kickoff time (±2h),
-// disambiguating by venue if two games share a time. Mutates `games` in place.
+// disambiguating simultaneous kickoffs by city rather than stadium name —
+// stadiums get sponsor-renamed mid-tournament (e.g. Azteca → Estadio
+// Banorte) but the host city never changes. Mutates `games` in place.
 function resolveBracket(games, fixtures) {
   if(!fixtures||!fixtures.length) return
   for(const g of games){
@@ -254,67 +256,154 @@ function resolveBracket(games, fixtures) {
     let match=null
     if(cands.length===1){ match=cands[0] }
     else if(cands.length>1){
-      const vtok=((g.v.split(',')[0]||'').toLowerCase().trim().split(' ')[0])
-      match=cands.find(f=>f.venue&&vtok&&f.venue.toLowerCase().indexOf(vtok)>=0)||null
+      // Our `v` field is "Venue, City" — take the city half
+      const cityTok=((g.v.split(',')[1]||g.v.split(',')[0]||'').toLowerCase().trim())
+      match=cands.find(f=>f.city&&cityTok&&f.city.toLowerCase().indexOf(cityTok)>=0)||cands[0]
     }
     if(match){ g.t1=match.t1; g.t2=match.t2 }
   }
 }
 
 // ── FETCH SCORES + BRACKET FROM ESPN ──────────────────────────
-// Returns { scoreMap, fixtures }.
-//   scoreMap: keyed by sorted team pair → live/final scores
-//   fixtures: every event with two *known* teams → { t, t1, t2, venue }
-//             used to fill in knockout slots once the bracket is set
-async function fetchESPN() {
-  const scoreMap={}, fixtures=[]
-  function processEvents(events) {
-    for(const ev of(events||[])){
-      const comp=(ev.competitions||[])[0]; if(!comp)continue
-      const comps=comp.competitors||[]; if(comps.length<2)continue
-      const nm1=comps[0].team.displayName||comps[0].team.name||''
-      const nm2=comps[1].team.displayName||comps[1].team.name||''
+// ESPN's scoreboard endpoint isn't reliable with very wide multi-week
+// date ranges — it can silently cap or drop events instead of erroring,
+// which is why knockout fixtures were failing to resolve. The fix is to
+// always query small, targeted windows instead of one huge range.
 
-      // Bracket fixture — only when both teams are real (not "TBD")
-      const t=Date.parse(ev.date||comp.date||'')
-      const venue=(comp.venue&&comp.venue.fullName)||''
-      const c1=CANON[normTeam(nm1)], c2=CANON[normTeam(nm2)]
-      if(t&&c1&&c2){ fixtures.push({t,t1:c1,t2:c2,venue}) }
+// Mutates the shared scoreMap/fixtures accumulators so multiple window
+// fetches can be merged together.
+function processEvents(events, scoreMap, fixtures) {
+  for(const ev of(events||[])){
+    const comp=(ev.competitions||[])[0]; if(!comp)continue
+    const comps=comp.competitors||[]; if(comps.length<2)continue
+    const nm1=comps[0].team.displayName||comps[0].team.name||''
+    const nm2=comps[1].team.displayName||comps[1].team.name||''
 
-      // Score — only when live or finished
-      const type=(ev.status||{}).type||{}
-      const done=type.completed===true
-      const live=type.name==='STATUS_IN_PROGRESS'||type.state==='in'
-      if(done||live){
-        const scores={},normNames=[]
-        for(const c of comps){
-          const n=normTeam(c.team.displayName||c.team.name||'')
-          scores[n]=c.score||'0'; normNames.push(n)
-        }
-        normNames.sort()
-        scoreMap[normNames.join('|')]={scores,done,live}
+    // Bracket fixture — only when both teams are real (not "TBD").
+    // City (not stadium name) is captured for disambiguation — stadium
+    // sponsor names can change mid-tournament, city names don't.
+    const t=Date.parse(ev.date||comp.date||'')
+    const city=(comp.venue&&comp.venue.address&&comp.venue.address.city)||''
+    const c1=CANON[normTeam(nm1)], c2=CANON[normTeam(nm2)]
+    if(t&&c1&&c2){ fixtures.push({t,t1:c1,t2:c2,city}) }
+
+    // Score — only when live or finished
+    const statusObj=comp.status||ev.status||{}
+    const type=statusObj.type||{}
+    const done=type.completed===true
+    const live=type.name==='STATUS_IN_PROGRESS'||type.state==='in'
+    if(done||live){
+      const scores={},normNames=[]
+      let winner=null, shootout=null
+      for(const c of comps){
+        const n=normTeam(c.team.displayName||c.team.name||'')
+        scores[n]=c.score||'0'; normNames.push(n)
+        // ESPN flags the actual winner even when reg/ET score is tied
+        // (i.e. decided on penalties) — this is the reliable signal.
+        if(c.winner===true) winner=n
+        // Shootout score isn't consistently keyed across ESPN's soccer
+        // payloads; try the couple of shapes it's been seen under.
+        const so=c.shootoutScore ?? c.score?.shootout ?? null
+        if(so!=null){ shootout=shootout||{}; shootout[n]=so }
       }
+      normNames.sort()
+      // Match clock for live games — ESPN's shortDetail is purpose-built
+      // for this ("63'", "HT", "45+2'"); displayClock is the fallback.
+      const clock = live ? (type.shortDetail||statusObj.displayClock||null) : null
+      scoreMap[normNames.join('|')]={scores,done,live,winner,shootout,clock}
     }
   }
-  try {
-    // Full tournament range — gets past scores AND upcoming bracket fixtures
-    const req=new Request("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=20260611-20260719&limit=300")
-    req.timeoutInterval=8; const data=await req.loadJSON()
-    if(data.events&&data.events.length>0){ processEvents(data.events) }
-    else {
-      const r2=new Request("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard")
-      r2.timeoutInterval=5; processEvents((await r2.loadJSON()).events)
-    }
-  } catch(e){ console.error("ESPN: "+e.message) }
-  return {scoreMap,fixtures}
 }
 
-// Score lookup for widget context
+// Single small, targeted fetch — e.g. "20260630-20260703".
+// Returns fresh {scoreMap, fixtures} for just that window.
+async function fetchESPNWindow(datesParam) {
+  const scoreMap={}, fixtures=[]
+  try {
+    const url="https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates="+datesParam+"&limit=100"
+    const req=new Request(url); req.timeoutInterval=7
+    const data=await req.loadJSON()
+    processEvents(data.events, scoreMap, fixtures)
+  } catch(e){ console.error("ESPN "+datesParam+": "+e.message) }
+  return {scoreMap, fixtures}
+}
+
+// Fetch several windows and merge — used when full-tournament coverage
+// is needed (the day browser, where any date can be navigated to).
+async function fetchESPNMulti(windows) {
+  const scoreMap={}, fixtures=[]
+  for(const win of windows){
+    const r=await fetchESPNWindow(win)
+    Object.assign(scoreMap, r.scoreMap)
+    fixtures.push(...r.fixtures)
+  }
+  return {scoreMap, fixtures}
+}
+
+// The tournament's distinct phases, as small date windows. Querying these
+// separately (instead of one 20260611-20260719 sweep) avoids the range
+// being too wide for ESPN to return in full.
+const PHASE_WINDOWS = [
+  '20260611-20260627', // Group Stage
+  '20260628-20260703', // Round of 32
+  '20260704-20260707', // Round of 16
+  '20260709-20260712', // Quarterfinals
+  '20260714-20260715', // Semifinals
+  '20260718-20260719', // 3rd Place + Final
+]
+async function fetchESPNFull() { return fetchESPNMulti(PHASE_WINDOWS) }
+
+// Plain query, no dates param — ESPN's endpoints default this to "today's"
+// slate. This is a safety net alongside the explicit date windows: it's
+// unconfirmed whether a dates-range query reflects real team names for a
+// knockout game that hasn't kicked off yet (vs. one already live/finished),
+// so today's game gets checked both ways rather than relying on one path.
+async function fetchESPNCurrent() {
+  const scoreMap={}, fixtures=[]
+  try {
+    const req=new Request("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard")
+    req.timeoutInterval=6
+    const data=await req.loadJSON()
+    processEvents(data.events, scoreMap, fixtures)
+  } catch(e){ console.error("ESPN current: "+e.message) }
+  return {scoreMap, fixtures}
+}
+
+// Format a Date as UTC YYYYMMDD
+function ymdUTC(d) {
+  const y=d.getUTCFullYear(), m=String(d.getUTCMonth()+1).padStart(2,'0'), dd=String(d.getUTCDate()).padStart(2,'0')
+  return ''+y+m+dd
+}
+
+// Build the minimal "start-end" window covering a specific set of games,
+// padded a day on each side for timezone safety. Used by the widget,
+// which only ever needs to resolve/score the handful of games it's about
+// to display — not the whole tournament.
+function windowForGames(games) {
+  if(!games.length) return null
+  let min=null, max=null
+  for(const g of games){
+    const t=kickoffDate(g).getTime()
+    if(min===null||t<min) min=t
+    if(max===null||t>max) max=t
+  }
+  const day=86400000
+  return ymdUTC(new Date(min-day))+'-'+ymdUTC(new Date(max+day))
+}
+
+// Score lookup for widget context.
+// Adds `pens` (true if decided on penalties) and `wonBy` (1 or 2, which
+// team won) so the UI can indicate a shootout instead of showing a flat tie.
 function getWidgetScore(scoreMap,g) {
   const n1=normTeam(g.t1),n2=normTeam(g.t2)
   const key=[n1,n2].sort().join('|')
   const sc=scoreMap[key]; if(!sc)return null
-  return{s1:sc.scores[n1]||'?',s2:sc.scores[n2]||'?',done:sc.done,live:sc.live}
+  const s1=sc.scores[n1]||'?', s2=sc.scores[n2]||'?'
+  const tied = s1===s2
+  const wonBy = sc.winner===n1?1:sc.winner===n2?2:null
+  const pens = !!(sc.done && tied && wonBy)
+  const so1 = sc.shootout&&sc.shootout[n1], so2 = sc.shootout&&sc.shootout[n2]
+  return{s1,s2,done:sc.done,live:sc.live,pens,wonBy,so1,so2,clock:sc.clock}
 }
 
 // ── HOME SCREEN WIDGET ────────────────────────────────────────
@@ -322,13 +411,12 @@ async function buildWidget() {
   const size=config.widgetFamily||"medium"
   const maxRows={small:2,medium:4,large:8}[size]||4
   const isSmall=size==="small"
-  const espn=await fetchESPN()
-  const scoreMap=espn.scoreMap
-  resolveBracket(GAMES, espn.fixtures)   // fill in knockout names if known
   const todayKey=getTodayKey()
   const now=Date.now()
 
-  // All today's games (past, live, upcoming) in local timezone
+  // Determine which games to show FIRST, before touching the network —
+  // placeholder team names don't affect date filtering, since kickoff
+  // times (um/ud/uh) are fixed regardless of who's playing.
   let games=GAMES.filter(g=>localDayKey(g)===todayKey)
   let label="Today · "+keyToLabel(todayKey)
 
@@ -342,6 +430,17 @@ async function buildWidget() {
       label="Next: "+keyToLabel(nxtKey)
     } else { label="Tournament complete 🏆" }
   }
+
+  // Fetch the narrow window covering these specific games, AND the plain
+  // "current" endpoint as a safety net (see fetchESPNCurrent above) — today's
+  // game gets checked both ways since it's unconfirmed which one ESPN
+  // reliably populates with real team names before kickoff.
+  const win=windowForGames(games)
+  const winResult=win?await fetchESPNWindow(win):{scoreMap:{},fixtures:[]}
+  const curResult=await fetchESPNCurrent()
+  const scoreMap={...winResult.scoreMap,...curResult.scoreMap}
+  const fixtures=[...winResult.fixtures,...curResult.fixtures]
+  resolveBracket(games, fixtures)   // fill in knockout names if known
 
   const w=new ListWidget()
   w.backgroundColor=C.bg
@@ -392,18 +491,21 @@ async function buildWidget() {
         row.addSpacer(4)
       }
 
-      // Team 1: fixed width, left-aligned
+      // Team 1: fixed width, left-aligned. Winner (on penalties) gets full
+      // brightness even if the game is over; loser dims as usual.
       const t1s=row.addStack()
       if(!isSmall) t1s.size=new Size(TW,SH)
       t1s.layoutHorizontally(); t1s.centerAlignContent()
       if(f1){const fl=t1s.addText(f1);fl.font=Font.systemFont(fs);t1s.addSpacer(3)}
       const n1=t1s.addText(sn1); n1.lineLimit=1; n1.minimumScaleFactor=0.6
-      n1.font=Font.semiboldSystemFont(ns)
-      n1.textColor=isGO&&!sc?C.dim:isUSA?C.usa:C.text
+      n1.font=sc&&sc.pens&&sc.wonBy===1?Font.boldSystemFont(ns):Font.semiboldSystemFont(ns)
+      n1.textColor=isGO&&!sc?C.dim:isUSA?C.usa:(sc&&sc.pens&&sc.wonBy===2?C.dim:C.text)
 
       row.addSpacer()
 
-      // Center: fixed width, internal flex spacers center content horizontally
+      // Center: fixed width, internal flex spacers center content horizontally.
+      // Kept as a single line (score + optional "PK" tag) so row height
+      // stays identical across every row, regardless of penalty shootouts.
       const ctr=row.addStack()
       if(!isSmall) ctr.size=new Size(CW,SH)
       ctr.layoutHorizontally(); ctr.centerAlignContent()
@@ -412,6 +514,14 @@ async function buildWidget() {
         const sv=ctr.addText(sc.s1+"–"+sc.s2)
         sv.font=Font.boldSystemFont(isSmall?12:13)
         sv.textColor=sc.live?C.blue:C.text
+        if(sc.pens && !isSmall){
+          ctr.addSpacer(2)
+          const pk=ctr.addText("PK"); pk.font=Font.boldSystemFont(6); pk.textColor=C.dim
+        } else if(sc.live && sc.clock && !isSmall){
+          // Match clock ("63'", "HT") next to the live score
+          ctr.addSpacer(2)
+          const cl=ctr.addText(sc.clock); cl.font=Font.boldSystemFont(6); cl.textColor=C.blue
+        }
       } else if(isGL){
         const dot=ctr.addText("●"); dot.font=Font.systemFont(9); dot.textColor=C.blue
       } else if(isGO){
@@ -424,14 +534,14 @@ async function buildWidget() {
 
       row.addSpacer()
 
-      // Team 2: fixed width, right-aligned
+      // Team 2: fixed width, right-aligned. Same winner-highlight logic as team 1.
       const t2s=row.addStack()
       if(!isSmall) t2s.size=new Size(TW,SH)
       t2s.layoutHorizontally(); t2s.centerAlignContent()
       t2s.addSpacer()
       const n2=t2s.addText(sn2); n2.lineLimit=1; n2.minimumScaleFactor=0.6
-      n2.font=Font.semiboldSystemFont(ns)
-      n2.textColor=isGO&&!sc?C.dim:isUSA?C.usa:C.text
+      n2.font=sc&&sc.pens&&sc.wonBy===2?Font.boldSystemFont(ns):Font.semiboldSystemFont(ns)
+      n2.textColor=isGO&&!sc?C.dim:isUSA?C.usa:(sc&&sc.pens&&sc.wonBy===1?C.dim:C.text)
       if(f2){t2s.addSpacer(3);const fl2=t2s.addText(f2);fl2.font=Font.systemFont(fs)}
     }
 
@@ -500,10 +610,14 @@ body{background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,san
 .tname{font-size:13px;font-weight:600;color:#d8e8ff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tname-usa{color:#f0a500}
 .tname-ft {color:#5a7285}
+.tname-winner{color:#e8f0ff;font-weight:800}
 .score-ctr{flex-shrink:0;min-width:64px;text-align:center}
 .score-val{font-size:26px;font-weight:800;color:#fff;letter-spacing:1px;line-height:1}
 .score-val.live{color:#3b9eff}
+.score-val.faded{opacity:.45}
 .score-dash{font-size:20px;font-weight:300;opacity:.4;margin:0 1px}
+.pk-label{font-size:9px;font-weight:800;color:#7a90a8;letter-spacing:1px;margin-top:3px;text-align:center}
+.pk-sub{font-size:9px;color:#4a6070;font-weight:600;margin-top:1px;text-align:center}
 .vs-label{font-size:12px;font-weight:600;color:#4a6070;letter-spacing:1px}
 @keyframes fadeUp{from{opacity:0;transform:translateY(7px) scale(.9)}to{opacity:1;transform:translateY(0) scale(1)}}
 .animate-in{animation:fadeUp .5s cubic-bezier(.34,1.5,.64,1) both}
@@ -573,7 +687,7 @@ function normTeam(name){
   var map={'korea republic':'south korea','czech republic':'czechia','bosnia-herzegovina':'bosnia',
     'bosnia and herzegovina':'bosnia','bosnia & herz.':'bosnia','turkey':'turkiye','türkiye':'turkiye',
     "cote d'ivoire":'ivory coast',"côte d'ivoire":'ivory coast','ivory coast':'ivory coast',
-    'united states':'usa','dr congo':'dr congo','dem. rep. congo':'dr congo',
+    'united states':'usa','dr congo':'dr congo','congo dr':'dr congo','dem. rep. congo':'dr congo',
     'democratic republic of congo':'dr congo','curacao':'curacao','curaçao':'curacao'};
   var l=(name||'').toLowerCase().trim(); return map[l]||l;
 }
@@ -581,7 +695,12 @@ function getScore(g){
   var n1=normTeam(g.t1),n2=normTeam(g.t2);
   var key=[n1,n2].sort().join('|');
   var sc=SCORES[key]; if(!sc)return null;
-  return{s1:sc.scores[n1]||'?',s2:sc.scores[n2]||'?',done:sc.done,live:sc.live};
+  var s1=sc.scores[n1]||'?', s2=sc.scores[n2]||'?';
+  var tied = s1===s2;
+  var wonBy = sc.winner===n1?1:sc.winner===n2?2:null;
+  var pens = !!(sc.done && tied && wonBy);
+  var so1 = sc.shootout&&sc.shootout[n1], so2 = sc.shootout&&sc.shootout[n2];
+  return{s1:s1,s2:s2,done:sc.done,live:sc.live,pens:pens,wonBy:wonBy,so1:so1,so2:so2,clock:sc.clock};
 }
 function badgeLabel(grp){
   var m={R32:'Rd 32',R16:'Rd 16',QF:'QF',SF:'SF','3RD':'3rd Pl','FIN':'FINAL'};
@@ -635,28 +754,43 @@ function makeCard(g,isToday,isPast){
   var isUSA=!!g.usa;
   var cc='card'+(isUSA?' card-usa':isLive?' card-live':isOver?' card-ft':' card-up');
   var bc='badge'+(isUSA?' badge-usa':isLive?' badge-live':'');
-  var tc='tname'+(isUSA?' tname-usa':isOver?' tname-ft':'');
+
+  // Team name class: winner-on-penalties gets bright/bold treatment even
+  // though the game is "over"; the penalty loser dims same as a normal loss.
+  var tc1='tname'+(isUSA?' tname-usa':sc&&sc.pens?(sc.wonBy===1?' tname-winner':' tname-ft'):isOver?' tname-ft':'');
+  var tc2='tname'+(isUSA?' tname-usa':sc&&sc.pens?(sc.wonBy===2?' tname-winner':' tname-ft'):isOver?' tname-ft':'');
 
   var statusH;
-  if(isLive){statusH='<div class="status-live"><span class="dot-live"></span>LIVE</div>';}
-  else if(isOver){statusH='<div class="status-ft">FT</div>';}
+  if(isLive){
+    var liveText=(sc&&sc.clock)?sc.clock:'LIVE';
+    statusH='<div class="status-live"><span class="dot-live"></span>'+liveText+'</div>';
+  }
+  else if(isOver){statusH='<div class="status-ft">'+(sc&&sc.pens?'FT (PENS)':'FT')+'</div>';}
   else{statusH='<div class="status-up">'+displayTime(g)+'</div>';}
   var header='<div class="card-top"><span class="'+bc+'">'+badgeLabel(g.grp)+'</span>'+statusH+'</div>';
 
   var f1=flag(g.t1),f2=flag(g.t2);
-  var t1H='<div class="team-l">'+(f1?'<span class="flag">'+f1+'</span>':'')+'<span class="'+tc+'">'+g.t1+'</span></div>';
-  var t2H='<div class="team-r"><span class="'+tc+'">'+g.t2+'</span>'+(f2?'<span class="flag">'+f2+'</span>':'')+'</div>';
+  var t1H='<div class="team-l">'+(f1?'<span class="flag">'+f1+'</span>':'')+'<span class="'+tc1+'">'+g.t1+'</span></div>';
+  var t2H='<div class="team-r"><span class="'+tc2+'">'+g.t2+'</span>'+(f2?'<span class="flag">'+f2+'</span>':'')+'</div>';
 
   var ctrH;
   if(sc&&(sc.done||sc.live)){
     var sv='score-val animate-in'+(sc.live?' live':'');
-    ctrH='<div class="score-ctr"><div class="'+sv+'">'+sc.s1+'<span class="score-dash">&ndash;</span>'+sc.s2+'</div></div>';
+    var scoreLine='<div class="'+sv+'">'+sc.s1+'<span class="score-dash">&ndash;</span>'+sc.s2+'</div>';
+    var pkLine='';
+    if(sc.pens){
+      // Show the shootout score if ESPN provided one, otherwise just flag it as pens
+      pkLine = (sc.so1!=null&&sc.so2!=null)
+        ? '<div class="pk-sub">('+sc.so1+'&ndash;'+sc.so2+' pens)</div>'
+        : '<div class="pk-label">PENS</div>';
+    }
+    ctrH='<div class="score-ctr">'+scoreLine+pkLine+'</div>';
   } else {
     ctrH='<div class="score-ctr"><div class="vs-label">'+(isOver?'&ndash;':'vs')+'</div></div>';
   }
 
   var vc=isLive?'venue venue-live':'venue';
-  return'<div class="'+cc+'"><div class="card-top"><span class="'+bc+'">'+badgeLabel(g.grp)+'</span>'+statusH+'</div>'
+  return'<div class="'+cc+'">'+header
     +'<div class="matchup">'+t1H+ctrH+t2H+'</div>'
     +'<div class="'+vc+'">'+g.v+'</div></div>';
 }
@@ -696,7 +830,14 @@ render();
 if(config.runsInWidget){
   const w=await buildWidget(); Script.setWidget(w)
 } else {
-  const espn=await fetchESPN()
+  // Browser can navigate to any day across the whole tournament, so it
+  // needs full coverage — fetched as several small windows, not one wide
+  // one — plus the plain "current" endpoint merged in as a safety net for
+  // whichever day is actually happening right now (see fetchESPNCurrent).
+  const espn=await fetchESPNFull()
+  const cur=await fetchESPNCurrent()
+  Object.assign(espn.scoreMap, cur.scoreMap)
+  espn.fixtures.push(...cur.fixtures)
   resolveBracket(GAMES, espn.fixtures)   // fill in knockout names if known
   const wv=new WebView()
   await wv.loadHTML(buildBrowserHTML(JSON.stringify(espn.scoreMap)))
